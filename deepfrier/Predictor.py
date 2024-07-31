@@ -10,6 +10,7 @@ import tensorflow as tf
 
 from .utils import load_catalogue, load_FASTA, load_predicted_PDB, seq2onehot
 from .layers import MultiGraphConv, GraphConv, FuncPredictor, SumPooling
+from shap import DeepExplainer
 
 
 class GradCAM(object):
@@ -46,6 +47,86 @@ class GradCAM(object):
         return heatmap.reshape(-1)
 
 
+class ExcitationBackpropogation(object):
+    """
+    Excitation Backpropogation for protein sequences.
+    """
+    def __init__(self, model, layer_name="GCNN_concatenate"):
+        self.grad_model = tf.keras.models.Model([model.inputs], [model.get_layer(layer_name).output, model.output])
+
+    def _get_gradients(self, inputs, class_idx, use_guided_grads=False):
+        with tf.GradientTape() as tape:
+            conv_outputs, predictions = self.grad_model(inputs)
+            loss = predictions[:, class_idx, 0]
+        grads = tape.gradient(loss, conv_outputs)
+
+        if use_guided_grads:
+            grads = tf.cast(conv_outputs > 0, "float32")*tf.cast(grads > 0, "float32")*grads
+
+        return conv_outputs, grads
+
+    def _compute_ebp(self, grads):
+        grads_tensor = tf.convert_to_tensor(grads, dtype=tf.float32)
+        ebp = tf.nn.relu(grads_tensor)
+        return ebp
+    
+    def compute_ebp(self, inputs, class_idx, use_guided_grads = False):
+        output, grads = self._get_gradients(inputs, class_idx, use_guided_grads=use_guided_grads)
+        ebp = self._compute_ebp(grads)
+        pooled = np.max(ebp, axis=2)
+        pooled = pooled[0]
+        heatmap = (pooled - pooled.min())/(pooled.max() - pooled.min())
+        return heatmap
+
+
+class PGExplainer(object):
+    """
+    PGExplainer for protein sequences.
+    """
+    def __init__(self, model, layer_name="GCNN_concatenate", num_perturbations = 100):
+        self.grad_model = tf.keras.models.Model([model.inputs], [model.get_layer(layer_name).output, model.output])
+        self.num_perturbations = num_perturbations
+
+    def explain(self, inputs, class_idx, use_guided_grads = False):
+        all_attributions = []
+        for _ in range(self.num_perturbations):
+            perturbed_inputs = self._perturb(inputs)
+            grads = self._get_gradients(inputs, class_idx, use_guided_grads)
+            attribution = self._compute_attribution(grads)
+            attribution = np.mean(attribution, axis=2)
+            all_attributions.append(attribution)
+        
+        # Aggregate the attribution scores
+        avg_attribution = tf.reduce_mean(all_attributions, axis=0)
+
+        # Normalize and reshape the attribution scores
+        heatmap = (avg_attribution - tf.reduce_min(avg_attribution)) / (tf.reduce_max(avg_attribution) - tf.reduce_min(avg_attribution))
+        return heatmap.numpy().reshape(-1)
+
+    def _perturb(self, inputs, stddev=0.1):
+        inputs = np.array(inputs)
+        # Perform perturbation on the input features
+        noise = np.random.normal(loc=0.0, scale=stddev, size=inputs.shape)
+        perturbed_inputs = inputs + noise
+        return perturbed_inputs
+
+    def _get_gradients(self, inputs, class_idx, use_guided_grads=False):
+        with tf.GradientTape() as tape:
+            conv_outputs, predictions = self.grad_model(inputs)
+            loss = predictions[:, class_idx, 0]
+        grads = tape.gradient(loss, conv_outputs)
+
+        if use_guided_grads:
+            grads = tf.cast(conv_outputs > 0, "float32")*tf.cast(grads > 0, "float32")*grads
+
+        return grads
+
+    def _compute_attribution(self, grads):
+        # Compute feature attributions based on the gradients
+        attribution = tf.abs(grads)
+        return attribution
+
+
 class Predictor(object):
     """
     Class for loading trained models and computing GO/EC predictions and class activation maps (CAMs).
@@ -61,6 +142,9 @@ class Predictor(object):
                                                                 'GraphConv': GraphConv,
                                                                 'FuncPredictor': FuncPredictor,
                                                                 'SumPooling': SumPooling})
+        model_weights = self.model.get_weights()
+        #print (model_weights)
+        
         # load parameters
         with open(self.model_prefix + "_model_params.json") as json_file:
             metadata = json.load(json_file)
@@ -219,11 +303,23 @@ class Predictor(object):
                         print (prot, row[0], '{:.5f}'.format(row[2]), row[1])
                     writer.writerow([prot, row[0], '{:.5f}'.format(row[2]), row[1]])
         csvFile.close()
+        
+    def calc_sparsity(self, saliency_list):
+        non_zero_count = sum(1 for value in saliency_list if value != 0)
+        sparsity = 1 - (non_zero_count / len(saliency_list))
+        return sparsity
+    
+    def to_csv(self, my_list, filename):
+        with open(filename, 'w', newline='') as file:
+            writer = csv.writer(file)
+            for item in my_list:
+                writer.writerow([item])
 
     def compute_GradCAM(self, layer_name='GCNN_concatenate', use_guided_grads=False):
         print ("### Computing GradCAM for each function of every predicted protein...")
         gradcam = GradCAM(self.model, layer_name=layer_name)
-
+        
+        sparsity = []
         self.pdb2cam = {}
         for go_indx in self.goidx2chains:
             pred_chains = list(self.goidx2chains[go_indx])
@@ -238,10 +334,80 @@ class Predictor(object):
                 self.pdb2cam[chain]['GO_ids'].append(self.goterms[go_indx])
                 self.pdb2cam[chain]['GO_names'].append(self.gonames[go_indx])
                 self.pdb2cam[chain]['sequence'] = self.data[chain][1]
-                self.pdb2cam[chain]['saliency_maps'].append(gradcam.heatmap(self.data[chain][0], go_indx, use_guided_grads=use_guided_grads).tolist())
-
+                heatmap = gradcam.heatmap(self.data[chain][0], go_indx, use_guided_grads=use_guided_grads).tolist()
+                self.pdb2cam[chain]['saliency_maps'].append(heatmap)
+                sparsity.append(self.calc_sparsity(heatmap))
+        print (sparsity)
+        self.to_csv(sparsity, 'GradCAM_sparsity.csv')
+                
+                
     def save_GradCAM(self, output_fn):
         print ("### Saving CAMs to *.json file...")
         # pickle.dump(self.pdb2cam, open(output_fn, 'wb'))
         with open(output_fn, 'w') as fw:
             json.dump(self.pdb2cam, fw, indent=1)
+    
+    def compute_EB(self, layer_name='GCNN_concatenate', use_guided_grads=False):
+        print ("### Computing EB for each function of every predicted protein...")
+        ebp = ExcitationBackpropogation(self.model, layer_name=layer_name)
+
+        sparsity = []
+        self.pdb2cam = {}
+        for go_indx in self.goidx2chains:
+            pred_chains = list(self.goidx2chains[go_indx])
+            print ("### Computing Excitation Backpropogation for ", self.gonames[go_indx], '... [# proteins=', len(pred_chains), ']')
+            for chain in pred_chains:
+                if chain not in self.pdb2cam:
+                    self.pdb2cam[chain] = {}
+                    self.pdb2cam[chain]['GO_ids'] = []
+                    self.pdb2cam[chain]['GO_names'] = []
+                    self.pdb2cam[chain]['sequence'] = None
+                    self.pdb2cam[chain]['saliency_maps'] = []
+                self.pdb2cam[chain]['GO_ids'].append(self.goterms[go_indx])
+                self.pdb2cam[chain]['GO_names'].append(self.gonames[go_indx])
+                self.pdb2cam[chain]['sequence'] = self.data[chain][1]
+                EBP = ebp.compute_ebp(self.data[chain][0], go_indx, use_guided_grads=use_guided_grads)
+                self.pdb2cam[chain]['saliency_maps'].append(EBP.tolist())
+                sparsity.append(self.calc_sparsity(EBP.tolist()))
+        print (sparsity)
+        self.to_csv(sparsity, 'EB_sparsity.csv')
+                    
+
+    def save_EB(self, output_fn):
+        print ("### Saving EB to *.json file...")
+        # pickle.dump(self.pdb2cam, open(output_fn, 'wb'))
+        with open(output_fn, 'w') as fw:
+            json.dump(self.pdb2cam, fw, indent=1)
+            
+    def compute_PGExplainer(self, layer_name='GCNN_concatenate', use_guided_grads=False):
+        print ("### Computing PGExplainer for each function of every predicted protein...")
+        pgexplainer = PGExplainer(self.model, layer_name=layer_name)
+
+        sparsity = []
+        self.pdb2cam = {}
+        for go_indx in self.goidx2chains:
+            pred_chains = list(self.goidx2chains[go_indx])
+            print ("### Computing PGExplainer for ", self.gonames[go_indx], '... [# proteins=', len(pred_chains), ']')
+            for chain in pred_chains:
+                if chain not in self.pdb2cam:
+                    self.pdb2cam[chain] = {}
+                    self.pdb2cam[chain]['GO_ids'] = []
+                    self.pdb2cam[chain]['GO_names'] = []
+                    self.pdb2cam[chain]['sequence'] = None
+                    self.pdb2cam[chain]['heatmap'] = []
+                self.pdb2cam[chain]['GO_ids'].append(self.goterms[go_indx])
+                self.pdb2cam[chain]['GO_names'].append(self.gonames[go_indx])
+                self.pdb2cam[chain]['sequence'] = self.data[chain][1]
+                heatmap = pgexplainer.explain(self.data[chain][0], go_indx, use_guided_grads = use_guided_grads)
+                self.pdb2cam[chain]['heatmap'].append(heatmap.tolist())
+                sparsity.append(self.calc_sparsity(heatmap.tolist()))
+        print (sparsity)
+        self.to_csv(sparsity, 'PGExplainer_sparsity.csv')
+
+    def save_PGExplainer(self, output_fn):
+        print ("### Saving PGExplainer to *.json file...")
+        # pickle.dump(self.pdb2cam, open(output_fn, 'wb'))
+        with open(output_fn, 'w') as fw:
+            json.dump(self.pdb2cam, fw, indent=1)
+
+

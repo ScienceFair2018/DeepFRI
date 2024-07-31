@@ -20,7 +20,7 @@ def draw_cam(window, cam, pdb_chain, goterm, sequence):
     # draw the class activation map
     buf = '%s: Function = %s' % (pdb_chain, goterm)
     fig, axes = plt.subplots(nrows=2, ncols=1)
-    axes[0].plot(x, y, color='gray', label='gradCAM')
+    axes[0].plot(x, y, color='gray', label='GradCAM')
     axes[0].set_title(buf, fontsize=16)
     axes[0].set_ylabel('Activation', fontsize=16)
     axes[0].set_xlim((0, len(seq)))
@@ -32,7 +32,7 @@ def draw_cam(window, cam, pdb_chain, goterm, sequence):
     axes[1].set_yticks([])
     axes[1].set_xticks([])
     plt.axis('tight')
-    plt.savefig("saliency_fig_" + pdb_chain + "_" + goterm.replace(':', '.') + ".png")
+    plt.savefig("heatmap_fig_" + pdb_chain + "_" + goterm.replace(':', '.') + ".png")
 
 
 # average over window, window has to be odd

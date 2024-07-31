@@ -18,6 +18,8 @@ if __name__ == "__main__":
     parser.add_argument('-v', '--verbose', help="Prints predictions.", action="store_true")
     parser.add_argument('--use_guided_grads', help="Use guided grads to compute gradCAM.", action="store_true")
     parser.add_argument('--saliency', help="Compute saliency maps for every protein and every MF-GO term/EC number.", action="store_true")
+    parser.add_argument('--eb', help="Compute Excitation Backpropogation on the protein", action = "store_true")
+    parser.add_argument('--pgexplainer', help="Compute PGExplainer on the protein", action = "store_true")
     args = parser.parse_args()
 
     with open(args.model_config) as json_file:
@@ -46,7 +48,7 @@ if __name__ == "__main__":
         if args.pdb_dir is not None:
             predictor.predict_from_PDB_dir(args.pdb_dir)
 
-        # save predictions
+        # save predictionspge
         predictor.export_csv(args.output_fn_prefix + "_" + ont.upper() + "_predictions.csv", args.verbose)
         predictor.save_predictions(args.output_fn_prefix + "_" + ont.upper() + "_pred_scores.json")
 
@@ -54,3 +56,19 @@ if __name__ == "__main__":
         if args.saliency and ont in ['mf', 'ec']:
             predictor.compute_GradCAM(layer_name=layer_name, use_guided_grads=args.use_guided_grads)
             predictor.save_GradCAM(args.output_fn_prefix + "_" + ont.upper() + "_saliency_maps.json")
+        
+        # save ebp values
+        if args.eb:
+            predictor.compute_EB(layer_name=layer_name, use_guided_grads=args.use_guided_grads)
+            predictor.save_EB(args.output_fn_prefix + "_" + "eb.json")
+            
+        # save pgexplainer values
+        if args.pgexplainer:
+            predictor.compute_PGExplainer(layer_name=layer_name, use_guided_grads=args.use_guided_grads)
+            predictor.save_PGExplainer(args.output_fn_prefix + "_" + "PGExplainer.json")
+
+
+
+
+
+
