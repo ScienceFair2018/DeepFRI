@@ -309,6 +309,18 @@ class Predictor(object):
         sparsity = 1 - (non_zero_count / len(saliency_list))
         return sparsity
     
+    def calc_fidelity(self, original_prediction, perturbed_prediction):
+        # Fidelity calculation logic
+        fidelity = np.abs(original_prediction - perturbed_prediction)
+        return np.mean(fidelity)
+
+    def calc_contrastivity(self, saliency_list_1, saliency_list_2):
+        # Contrastivity calculation logic
+        contrastivity = np.abs(np.array(saliency_list_1) - np.array(saliency_list_2))
+        return np.mean(contrastivity)
+
+
+    
     def to_csv(self, my_list, filename):
         with open(filename, 'w', newline='') as file:
             writer = csv.writer(file)
@@ -319,9 +331,10 @@ class Predictor(object):
         print ("### Computing GradCAM for each function of every predicted protein...")
         gradcam = GradCAM(self.model, layer_name=layer_name)
         
-        sparsity = []
+        sparsity, fidelity, contrastivity = [], [], []
         self.pdb2cam = {}
         for go_indx in self.goidx2chains:
+            count += 1
             pred_chains = list(self.goidx2chains[go_indx])
             print ("### Computing gradCAM for ", self.gonames[go_indx], '... [# proteins=', len(pred_chains), ']')
             for chain in pred_chains:
@@ -337,8 +350,16 @@ class Predictor(object):
                 heatmap = gradcam.heatmap(self.data[chain][0], go_indx, use_guided_grads=use_guided_grads).tolist()
                 self.pdb2cam[chain]['saliency_maps'].append(heatmap)
                 sparsity.append(self.calc_sparsity(heatmap))
-        print (sparsity)
+                original_prediction = self.Y_hat[0][go_indx]
+                perturbed_prediction = self.Y_hat[0][go_indx] * np.random.uniform(0.9, 1.1)
+                fidelity.append(self.calc_fidelity(heatmap, original_prediction, perturbed_prediction))
+                if prev_heatmap is not None:
+                    contrastivity.append(self.calc_contrastivity(prev_heatmap, heatmap))
+            prev_heatmap = heatmap
+        #print (sparsity)
         self.to_csv(sparsity, 'GradCAM_sparsity.csv')
+        self.to_csv(fidelity, 'GradCAM_fidelity.csv')
+        self.to_csv(contrastivity, 'GradCAM_contrastivity.csv')
                 
                 
     def save_GradCAM(self, output_fn):
